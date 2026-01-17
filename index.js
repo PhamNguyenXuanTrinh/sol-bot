@@ -1,19 +1,17 @@
+require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const { EMA, ATR, ADX } = require("technicalindicators");
 
 const app = express();
-
-// ================= ENV =================
 const PORT = process.env.PORT || 3002;
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 // ================= CONFIG =================
-const SYMBOL = "SOLUSDT";
+const SYMBOL = process.env.SYMBOL || "SOLUSDT";
 const BASE_INTERVAL = "5m";
-const RESAMPLE_FACTOR = 3; // 5m → 15m
+const RESAMPLE_FACTOR = 3;
 
+// === KHÔNG ĐỔI LOGIC ===
 const CONFIG = {
   initialBalance: 100,
   riskPerTrade: 0.006,
@@ -34,6 +32,22 @@ const CONFIG = {
   dailyLossLimit: 0.03
 };
 
+// ================= TELEGRAM =================
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+async function sendTelegram(msg) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+      { chat_id: TELEGRAM_CHAT_ID, text: msg }
+    );
+  } catch (e) {
+    console.log("Telegram error:", e.message);
+  }
+}
+
 // ================= STATE =================
 let balance = CONFIG.initialBalance;
 let peakBalance = balance;
@@ -48,24 +62,13 @@ let dayStartBalance = balance;
 let startupSent = false;
 let lastSentHour = null;
 
-// ================= TELEGRAM =================
-async function sendTelegram(msg) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
-
-  try {
-    await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-      { chat_id: TELEGRAM_CHAT_ID, text: msg }
-    );
-  } catch (e) {
-    console.error("Telegram error:", e.message);
-  }
-}
-
-// ================= BINANCE =================
+// ================= BINANCE FUTURES =================
 async function getKlines(symbol, interval, limit = 1000) {
-  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const res = await axios.get(url);
+  const res = await axios.get(
+    "https://fapi.binance.com/fapi/v1/klines",
+    { params: { symbol, interval, limit } }
+  );
+
   return res.data.map(k => ({
     time: k[0],
     open: +k[1],
@@ -79,11 +82,13 @@ async function getKlines(symbol, interval, limit = 1000) {
 async function getPrice(symbol) {
   try {
     const res = await axios.get(
-      `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`
+      "https://fapi.binance.com/fapi/v1/ticker/price",
+      { params: { symbol } }
     );
-    return +res.data.price;
+    const price = Number(res.data.price);
+    return Number.isFinite(price) ? price : null;
   } catch (e) {
-    console.error("Get price error:", e.message);
+    console.log("Get price error:", e.response?.status || e.message);
     return null;
   }
 }
@@ -105,48 +110,7 @@ function resampleTo15m(candles5m) {
   return out;
 }
 
-// ================= STARTUP =================
-async function startupReport() {
-  const price = await getPrice(SYMBOL) || "???";
-  await sendTelegram(
-    `🚀 BOT STARTED\n` +
-    `Strategy: EMA50/200 + ADX (15m)\n\n` +
-    `${SYMBOL}: ${price.toFixed(4)}\n` +
-    `Balance: ${balance.toFixed(2)}`
-  );
-  startupSent = true;
-}
-
-// ================= HEARTBEAT =================
-async function heartbeat() {
-  const now = new Date();
-  const hour = now.getHours();
-  const minute = now.getMinutes();
-
-  if (minute !== 0) return;
-  if (hour === lastSentHour) return;
-  lastSentHour = hour;
-
-  const price = await getPrice(SYMBOL) || "???";
-
-  let msg =
-    `🕒 ${hour.toString().padStart(2, "0")}:00 STATUS\n\n` +
-    `${SYMBOL}: ${price.toFixed(4)}\n` +
-    `Balance: ${balance.toFixed(2)}\n`;
-
-  if (openTrade) {
-    msg +=
-      `\n🟡 OPEN ${openTrade.direction}\n` +
-      `Entry: ${openTrade.entry.toFixed(4)}\n` +
-      `SL: ${openTrade.sl.toFixed(4)}`;
-  } else {
-    msg += `\nNo open trade`;
-  }
-
-  await sendTelegram(msg);
-}
-
-// ================= CORE LOGIC =================
+// ================= INDICATORS =================
 function calculateIndicators(candles) {
   const closes = candles.map(c => c.close);
   const highs = candles.map(c => c.high);
@@ -170,6 +134,7 @@ function calculateIndicators(candles) {
   };
 }
 
+// ================= ENTRY LOGIC (GIỮ NGUYÊN) =================
 function checkForEntry(candles) {
   if (candles.length < 250) return null;
 
@@ -208,12 +173,16 @@ function checkForEntry(candles) {
 // ================= MAIN LOOP =================
 async function botLoop() {
   try {
-    if (!startupSent) await startupReport();
-    await heartbeat();
+    if (!startupSent) {
+      const price = await getPrice(SYMBOL);
+      await sendTelegram(
+        `🚀 BOT STARTED\n${SYMBOL}: ${price ? price.toFixed(4) : "N/A"}\nBalance: ${balance.toFixed(2)}`
+      );
+      startupSent = true;
+    }
 
     const data5m = await getKlines(SYMBOL, BASE_INTERVAL);
     const candles15m = resampleTo15m(data5m);
-
     if (candles15m.length < 250) return;
 
     const lastCandle = candles15m[candles15m.length - 1];
@@ -226,9 +195,9 @@ async function botLoop() {
       dayStartBalance = balance;
     }
 
-    if ((dayStartBalance - balance) / dayStartBalance > CONFIG.dailyLossLimit)
-      return;
+    if ((dayStartBalance - balance) / dayStartBalance > CONFIG.dailyLossLimit) return;
 
+    // ===== MANAGE TRADE =====
     if (openTrade) {
       const c = lastCandle;
 
@@ -273,18 +242,15 @@ async function botLoop() {
       }
     }
 
+    // ===== ENTRY =====
     if (!openTrade && cooldownCount === 0) {
       const signal = checkForEntry(candles15m);
-
       if (signal) {
         balance -= signal.entry * signal.qty * CONFIG.takerFee;
         openTrade = { ...signal, tp1Hit: false };
 
         await sendTelegram(
-          `🟢 OPEN ${signal.direction}\n` +
-          `Entry: ${signal.entry.toFixed(4)}\n` +
-          `SL: ${signal.sl.toFixed(4)}\n` +
-          `Balance: ${balance.toFixed(2)}`
+          `🟢 OPEN ${signal.direction}\nEntry: ${signal.entry.toFixed(4)}\nSL: ${signal.sl.toFixed(4)}\nBalance: ${balance.toFixed(2)}`
         );
       }
     }
@@ -293,19 +259,19 @@ async function botLoop() {
     peakBalance = Math.max(peakBalance, balance);
 
   } catch (e) {
-    console.error("Bot error:", e.message);
+    console.log("Bot error:", e.message);
     await sendTelegram(`❌ BOT ERROR: ${e.message}`);
   }
 }
 
-// ================= EXPRESS =================
+// ================= SERVER =================
 app.get("/", (req, res) => {
   res.json({ balance, peakBalance, openTrade, cooldownCount });
 });
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`🚀 BOT RUNNING → PORT ${PORT}`);
-  await botLoop();
+  botLoop();
 });
 
 setInterval(botLoop, 30 * 1000);
