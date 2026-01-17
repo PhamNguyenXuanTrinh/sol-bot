@@ -3,7 +3,11 @@ const axios = require("axios");
 const { EMA, ATR, ADX } = require("technicalindicators");
 
 const app = express();
-const PORT = 3002;
+
+// ================= ENV =================
+const PORT = process.env.PORT || 3002;
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 // ================= CONFIG =================
 const SYMBOL = "SOLUSDT";
@@ -30,10 +34,6 @@ const CONFIG = {
   dailyLossLimit: 0.03
 };
 
-// ================= TELEGRAM =================
-const TELEGRAM_TOKEN = "7987504478:AAGBI3iUksFq2valbRMbkZCc3Uq5qsPf9Zc";
-const TELEGRAM_CHAT_ID = "6596026817";
-
 // ================= STATE =================
 let balance = CONFIG.initialBalance;
 let peakBalance = balance;
@@ -50,6 +50,8 @@ let lastSentHour = null;
 
 // ================= TELEGRAM =================
 async function sendTelegram(msg) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+
   try {
     await axios.post(
       `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
@@ -108,7 +110,7 @@ async function startupReport() {
   const price = await getPrice(SYMBOL) || "???";
   await sendTelegram(
     `🚀 BOT STARTED\n` +
-    `Strategy: EMA50/200 + ADX (15m) - MATCH BACKTEST\n\n` +
+    `Strategy: EMA50/200 + ADX (15m)\n\n` +
     `${SYMBOL}: ${price.toFixed(4)}\n` +
     `Balance: ${balance.toFixed(2)}`
   );
@@ -179,7 +181,6 @@ function checkForEntry(candles) {
 
   let signal = null;
 
-  // Điều kiện chính xác giống backtest 100%
   if (ind.close > ind.ema200 && last.low <= ind.ema50 && ind.close > ind.ema50)
     signal = "LONG";
 
@@ -188,7 +189,7 @@ function checkForEntry(candles) {
 
   if (!signal) return null;
 
-  const entry = ind.close;  // Dùng close của nến vừa đóng - giống backtest
+  const entry = ind.close;
   const slDist = ind.atr * CONFIG.slATR;
 
   const sl = signal === "LONG" ? entry - slDist : entry + slDist;
@@ -211,37 +212,23 @@ async function botLoop() {
     await heartbeat();
 
     const data5m = await getKlines(SYMBOL, BASE_INTERVAL);
-    console.log(`→ Số nến 5m lấy được: ${data5m.length}`);
-
     const candles15m = resampleTo15m(data5m);
-    console.log(`→ Số nến 15m sau resample: ${candles15m.length}`);
 
-    if (candles15m.length < 250) {
-      console.log("Not enough data yet... (chờ thêm vài phút)");
-      return;
-    }
+    if (candles15m.length < 250) return;
 
     const lastCandle = candles15m[candles15m.length - 1];
-
-    // Chỉ xử lý khi có nến mới hoàn toàn (giống backtest)
     if (lastCandle.time === lastProcessedCandleTime) return;
     lastProcessedCandleTime = lastCandle.time;
 
-    console.log(`→ New 15m candle: ${new Date(lastCandle.time).toISOString()}`);
-
-    // Cập nhật ngày & daily loss limit
     const day = new Date(lastCandle.time).toISOString().slice(0, 10);
     if (day !== currentDay) {
       currentDay = day;
       dayStartBalance = balance;
     }
 
-    if ((dayStartBalance - balance) / dayStartBalance > CONFIG.dailyLossLimit) {
-      console.log("Daily loss limit reached. Skipping...");
+    if ((dayStartBalance - balance) / dayStartBalance > CONFIG.dailyLossLimit)
       return;
-    }
 
-    // ===== MANAGE EXISTING TRADE =====
     if (openTrade) {
       const c = lastCandle;
 
@@ -286,7 +273,6 @@ async function botLoop() {
       }
     }
 
-    // ===== ENTRY on new closed candle =====
     if (!openTrade && cooldownCount === 0) {
       const signal = checkForEntry(candles15m);
 
@@ -318,8 +304,8 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`🚀 BOT RUNNING → http://localhost:${PORT}`);
-  await botLoop(); // Chạy lần đầu
+  console.log(`🚀 BOT RUNNING → PORT ${PORT}`);
+  await botLoop();
 });
 
 setInterval(botLoop, 30 * 1000);
