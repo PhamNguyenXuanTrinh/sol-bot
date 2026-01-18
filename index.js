@@ -1,22 +1,26 @@
-require("dotenv").config();
+require("dotenv").config();  // Phải để ở đầu file
+
 const express = require("express");
 const axios = require("axios");
-const { EMA, ATR, ADX } = require("technicalindicators");
+const crypto = require("crypto");
 
+/* ================= SERVER ================= */
 const app = express();
 const PORT = process.env.PORT || 3002;
 
-// ================= CONFIG =================
-const SYMBOL = process.env.SYMBOL || "SOLUSDT";
-const BASE_INTERVAL = "5m";
-const RESAMPLE_FACTOR = 3;
+/* ================= BINANCE ================= */
+const SYMBOL = "SOLUSDT";
+const BASE_URL = "https://testnet.binancefuture.com";
 
-// === KHÔNG ĐỔI LOGIC ===
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const BINANCE_KEY = process.env.BINANCE_KEY;
+const BINANCE_SECRET = process.env.BINANCE_SECRET;
+
+/* ================= CONFIG ================= */
 const CONFIG = {
-  initialBalance: 100,
   riskPerTrade: 0.006,
   leverage: 10,
-  takerFee: 0.0004,
 
   emaFast: 50,
   emaSlow: 200,
@@ -26,252 +30,337 @@ const CONFIG = {
   rr2: 2.2,
 
   adxPeriod: 14,
-  adxMin: 20,
-
-  cooldownBars: 30,
-  dailyLossLimit: 0.03
+  adxMin: 20
 };
 
-// ================= TELEGRAM =================
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const RESAMPLE_FACTOR = 3;
+
+/* ================= STATE ================= */
+let hasOpenedTrade = false;
+let lastCheck = 0;
+let startBalance = 0;
+let lastHourlyReport = null;
+
+/* ================= UTILS ================= */
+function sign(query) {
+  return crypto.createHmac("sha256", BINANCE_SECRET).update(query).digest("hex");
+}
+
+function vnTime(ts = Date.now()) {
+  return new Date(ts + 7 * 60 * 60 * 1000)
+    .toISOString()
+    .replace("T", " ")
+    .slice(0, 19);
+}
 
 async function sendTelegram(msg) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
     await axios.post(
       `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-      { chat_id: TELEGRAM_CHAT_ID, text: msg }
+      { chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: "HTML" }
     );
-  } catch (e) {
-    console.log("Telegram error:", e.message);
+  } catch (err) {
+    console.error("Telegram send error:", err.message);
   }
 }
 
-// ================= STATE =================
-let balance = CONFIG.initialBalance;
-let peakBalance = balance;
+async function binanceRequest(method, path, params = {}, signed = false) {
+  let query = new URLSearchParams(params).toString();
+  if (signed) {
+    query += (query ? "&" : "") + `timestamp=${Date.now()}`;
+    query += `&signature=${sign(query)}`;
+  }
 
-let openTrade = null;
-let cooldownCount = 0;
+  const url = `${BASE_URL}${path}?${query}`;
 
-let lastProcessedCandleTime = 0;
-let currentDay = "";
-let dayStartBalance = balance;
+  try {
+    const res = await axios({
+      method,
+      url,
+      headers: { "X-MBX-APIKEY": BINANCE_KEY }
+    });
+    return res.data;
+  } catch (err) {
+    console.error(`Binance ${method} ${path} error:`, err.response?.data || err.message);
+    throw err;
+  }
+}
 
-let startupSent = false;
-let lastSentHour = null;
+/* ================= DATA ================= */
+async function getBalance() {
+  const data = await binanceRequest("GET", "/fapi/v2/balance", {}, true);
+  const usdt = data.find(x => x.asset === "USDT");
+  return usdt ? parseFloat(usdt.availableBalance) : 0;
+}
 
-// ================= BINANCE FUTURES =================
-async function getKlines(symbol, interval, limit = 1000) {
+async function getSOLPrice() {
+  const res = await axios.get(`${BASE_URL}/fapi/v1/ticker/price?symbol=${SYMBOL}`);
+  return parseFloat(res.data.price);
+}
+
+async function fetchKlines5m(limit = 300) {
   const res = await axios.get(
-    "https://fapi.binance.com/fapi/v1/klines",
-    { params: { symbol, interval, limit } }
+    `${BASE_URL}/fapi/v1/klines?symbol=${SYMBOL}&interval=5m&limit=${limit}`
   );
-
   return res.data.map(k => ({
     time: k[0],
     open: +k[1],
     high: +k[2],
     low: +k[3],
-    close: +k[4],
-    volume: +k[5]
+    close: +k[4]
   }));
 }
 
-async function getPrice(symbol) {
-  try {
-    const res = await axios.get(
-      "https://fapi.binance.com/fapi/v1/ticker/price",
-      { params: { symbol } }
-    );
-    const price = Number(res.data.price);
-    return Number.isFinite(price) ? price : null;
-  } catch (e) {
-    console.log("Get price error:", e.response?.status || e.message);
-    return null;
-  }
-}
-
-// ================= RESAMPLE =================
-function resampleTo15m(candles5m) {
+/* ================= RESAMPLE ================= */
+function resampleTo15m(c5) {
   const out = [];
-  for (let i = 0; i + RESAMPLE_FACTOR <= candles5m.length; i += RESAMPLE_FACTOR) {
-    const chunk = candles5m.slice(i, i + RESAMPLE_FACTOR);
+  for (let i = 0; i < c5.length; i += RESAMPLE_FACTOR) {
+    const chunk = c5.slice(i, i + RESAMPLE_FACTOR);
+    if (chunk.length < RESAMPLE_FACTOR) break;
     out.push({
       time: chunk[chunk.length - 1].time,
       open: chunk[0].open,
       high: Math.max(...chunk.map(x => x.high)),
       low: Math.min(...chunk.map(x => x.low)),
-      close: chunk[chunk.length - 1].close,
-      volume: chunk.reduce((s, x) => s + x.volume, 0)
+      close: chunk[chunk.length - 1].close
     });
   }
   return out;
 }
 
-// ================= INDICATORS =================
-function calculateIndicators(candles) {
-  const closes = candles.map(c => c.close);
-  const highs = candles.map(c => c.high);
-  const lows = candles.map(c => c.low);
-
-  const ema50 = EMA.calculate({ period: CONFIG.emaFast, values: closes });
-  const ema200 = EMA.calculate({ period: CONFIG.emaSlow, values: closes });
-  const atr = ATR.calculate({ period: CONFIG.atrPeriod, high: highs, low: lows, close: closes });
-  const adx = ADX.calculate({ period: CONFIG.adxPeriod, high: highs, low: lows, close: closes });
-
-  const i = ema200.length - 1;
-
-  return {
-    ema50: ema50[i],
-    ema200: ema200[i],
-    atr: atr[i],
-    adx: adx[i]?.adx,
-    close: closes[i],
-    high: highs[i],
-    low: lows[i]
-  };
+/* ================= INDICATORS ================= */
+function EMA(arr, period) {
+  const k = 2 / (period + 1);
+  const out = Array(arr.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) {
+    sum += arr[i];
+    if (i === period - 1) out[i] = sum / period;
+    else if (i >= period) out[i] = arr[i] * k + out[i - 1] * (1 - k);
+  }
+  return out;
 }
 
-// ================= ENTRY LOGIC (GIỮ NGUYÊN) =================
-function checkForEntry(candles) {
-  if (candles.length < 250) return null;
-
-  const last = candles[candles.length - 1];
-  const ind = calculateIndicators(candles);
-
-  if (!ind.ema50 || !ind.ema200 || !ind.atr || !ind.adx) return null;
-  if (ind.adx <= CONFIG.adxMin) return null;
-
-  let signal = null;
-
-  if (ind.close > ind.ema200 && last.low <= ind.ema50 && ind.close > ind.ema50)
-    signal = "LONG";
-
-  if (ind.close < ind.ema200 && last.high >= ind.ema50 && ind.close < ind.ema50)
-    signal = "SHORT";
-
-  if (!signal) return null;
-
-  const entry = ind.close;
-  const slDist = ind.atr * CONFIG.slATR;
-
-  const sl = signal === "LONG" ? entry - slDist : entry + slDist;
-  const tp1 = signal === "LONG" ? entry + slDist : entry - slDist;
-  const tp2 = signal === "LONG" ? entry + slDist * CONFIG.rr2 : entry - slDist * CONFIG.rr2;
-
-  const riskUSD = balance * CONFIG.riskPerTrade;
-  const qty = (riskUSD / slDist) * CONFIG.leverage;
-
-  const fee = entry * qty * CONFIG.takerFee;
-  if (balance <= fee) return null;
-
-  return { direction: signal, entry, sl, tp1, tp2, qty };
+function ATR(candles, period) {
+  const out = Array(candles.length).fill(null);
+  let trSum = 0;
+  for (let i = 1; i < candles.length; i++) {
+    const tr = Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close)
+    );
+    if (i <= period) trSum += tr;
+    if (i === period) out[i] = trSum / period;
+    if (i > period) out[i] = (out[i - 1] * (period - 1) + tr) / period;
+  }
+  return out;
 }
 
-// ================= MAIN LOOP =================
-async function botLoop() {
+function ADX(candles, period) {
+  const adx = Array(candles.length).fill(null);
+  let tr = [], plusDM = [], minusDM = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const up = candles[i].high - candles[i - 1].high;
+    const dn = candles[i - 1].low - candles[i].low;
+    plusDM.push(up > dn && up > 0 ? up : 0);
+    minusDM.push(dn > up && dn > 0 ? dn : 0);
+    tr.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close)
+    ));
+  }
+
+  let atr = tr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  let pDI = plusDM.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  let mDI = minusDM.slice(0, period).reduce((a, b) => a + b, 0) / period;
+
+  const dx = [];
+  for (let i = period; i < tr.length; i++) {
+    atr = (atr * (period - 1) + tr[i]) / period;
+    pDI = (pDI * (period - 1) + plusDM[i]) / period;
+    mDI = (mDI * (period - 1) + minusDM[i]) / period;
+    const diSum = pDI + mDI;
+    dx.push(diSum === 0 ? 0 : 100 * Math.abs(pDI - mDI) / diSum);
+  }
+
+  if (dx.length < period) return adx;
+  adx[period * 2 - 1] = dx.slice(0, period).reduce((a, b) => a + b, 0) / period;
+
+  for (let i = period * 2; i < candles.length; i++) {
+    adx[i] = (adx[i - 1] * (period - 1) + dx[i - period]) / period;
+  }
+
+  return adx;
+}
+
+/* ================= SIGNAL ================= */
+function getSignal(c15, ema50, ema200, atr, adx) {
+  const i = c15.length - 1;
+  if (!ema50[i] || !ema200[i] || !atr[i] || !adx[i]) return null;
+  if (adx[i] <= CONFIG.adxMin) return null;
+
+  const close = c15[i].close;
+
+  // Long signal
+  if (close > ema200[i] && c15[i].low <= ema50[i] && close > ema50[i]) {
+    return {
+      side: "BUY",
+      entry: close,
+      sl: close - atr[i] * CONFIG.slATR,
+      tp: close + atr[i] * CONFIG.slATR * CONFIG.rr2
+    };
+  }
+
+  // Short signal
+  if (close < ema200[i] && c15[i].high >= ema50[i] && close < ema50[i]) {
+    return {
+      side: "SELL",
+      entry: close,
+      sl: close + atr[i] * CONFIG.slATR,
+      tp: close - atr[i] * CONFIG.slATR * CONFIG.rr2
+    };
+  }
+
+  return null;
+}
+
+/* ================= OPEN TRADE ================= */
+async function openTrade(signal) {
+  if (hasOpenedTrade) return;
+
   try {
-    if (!startupSent) {
-      const price = await getPrice(SYMBOL);
-      await sendTelegram(
-        `🚀 BOT STARTED\n${SYMBOL}: ${price ? price.toFixed(4) : "N/A"}\nBalance: ${balance.toFixed(2)}`
-      );
-      startupSent = true;
+    const balance = await getBalance();
+    const slDist = Math.abs(signal.entry - signal.sl);
+    const riskAmount = balance * CONFIG.riskPerTrade;
+    const qty = Math.floor((riskAmount / slDist) * CONFIG.leverage);
+
+    if (qty <= 0) {
+      console.log("Quantity too small:", qty);
+      return;
     }
 
-    const data5m = await getKlines(SYMBOL, BASE_INTERVAL);
-    const candles15m = resampleTo15m(data5m);
-    if (candles15m.length < 250) return;
+    // Set leverage
+    await binanceRequest("POST", "/fapi/v1/leverage", {
+      symbol: SYMBOL,
+      leverage: CONFIG.leverage
+    }, true);
 
-    const lastCandle = candles15m[candles15m.length - 1];
-    if (lastCandle.time === lastProcessedCandleTime) return;
-    lastProcessedCandleTime = lastCandle.time;
+    // Market entry
+    await binanceRequest("POST", "/fapi/v1/order", {
+      symbol: SYMBOL,
+      side: signal.side,
+      type: "MARKET",
+      quantity: qty
+    }, true);
 
-    const day = new Date(lastCandle.time).toISOString().slice(0, 10);
-    if (day !== currentDay) {
-      currentDay = day;
-      dayStartBalance = balance;
-    }
+    // Stop Loss
+    await binanceRequest("POST", "/fapi/v1/order", {
+      symbol: SYMBOL,
+      side: signal.side === "BUY" ? "SELL" : "BUY",
+      type: "STOP_MARKET",
+      stopPrice: signal.sl.toFixed(2),
+      closePosition: true
+    }, true);
 
-    if ((dayStartBalance - balance) / dayStartBalance > CONFIG.dailyLossLimit) return;
+    // Take Profit
+    await binanceRequest("POST", "/fapi/v1/order", {
+      symbol: SYMBOL,
+      side: signal.side === "BUY" ? "SELL" : "BUY",
+      type: "TAKE_PROFIT_MARKET",
+      stopPrice: signal.tp.toFixed(2),
+      closePosition: true
+    }, true);
 
-    // ===== MANAGE TRADE =====
-    if (openTrade) {
-      const c = lastCandle;
+    hasOpenedTrade = true;
 
-      if (!openTrade.tp1Hit) {
-        const hitTP1 = openTrade.direction === "LONG"
-          ? c.high >= openTrade.tp1
-          : c.low <= openTrade.tp1;
-
-        if (hitTP1) {
-          const qtyHalf = openTrade.qty / 2;
-          const pnl = (openTrade.tp1 - openTrade.entry) * qtyHalf *
-            (openTrade.direction === "LONG" ? 1 : -1);
-          const fee = openTrade.tp1 * qtyHalf * CONFIG.takerFee;
-
-          balance += pnl - fee;
-          openTrade.tp1Hit = true;
-          openTrade.sl = openTrade.entry;
-
-          await sendTelegram(`🎯 TP1 HIT | Balance: ${balance.toFixed(2)}`);
-        }
-      }
-
-      const hitSL = openTrade.direction === "LONG"
-        ? c.low <= openTrade.sl
-        : c.high >= openTrade.sl;
-
-      const hitTP2 = openTrade.direction === "LONG"
-        ? c.high >= openTrade.tp2
-        : c.low <= openTrade.tp2;
-
-      if (hitSL || hitTP2) {
-        const exit = hitSL ? openTrade.sl : openTrade.tp2;
-        const pnl = (exit - openTrade.entry) * openTrade.qty *
-          (openTrade.direction === "LONG" ? 1 : -1);
-        const fee = exit * openTrade.qty * CONFIG.takerFee;
-
-        balance += pnl - fee;
-        openTrade = null;
-        cooldownCount = CONFIG.cooldownBars;
-
-        await sendTelegram(`🔴 CLOSE ${hitSL ? "SL" : "TP2"} | Balance: ${balance.toFixed(2)}`);
-      }
-    }
-
-    // ===== ENTRY =====
-    if (!openTrade && cooldownCount === 0) {
-      const signal = checkForEntry(candles15m);
-      if (signal) {
-        balance -= signal.entry * signal.qty * CONFIG.takerFee;
-        openTrade = { ...signal, tp1Hit: false };
-
-        await sendTelegram(
-          `🟢 OPEN ${signal.direction}\nEntry: ${signal.entry.toFixed(4)}\nSL: ${signal.sl.toFixed(4)}\nBalance: ${balance.toFixed(2)}`
-        );
-      }
-    }
-
-    if (cooldownCount > 0) cooldownCount--;
-    peakBalance = Math.max(peakBalance, balance);
-
-  } catch (e) {
-    console.log("Bot error:", e.message);
-    await sendTelegram(`❌ BOT ERROR: ${e.message}`);
+    await sendTelegram(
+      `🚀 <b>OPEN ${signal.side}</b>\n` +
+      `⏰ ${vnTime()}\n` +
+      `Balance: ${balance.toFixed(2)} USDT\n` +
+      `Entry: ${signal.entry.toFixed(2)}\n` +
+      `SL: ${signal.sl.toFixed(2)}\n` +
+      `TP: ${signal.tp.toFixed(2)}\n` +
+      `Status: ĐANG VÀO LỆNH`
+    );
+  } catch (err) {
+    console.error("Open trade failed:", err);
+    await sendTelegram(`❌ Lỗi mở lệnh: ${err.message}`);
   }
 }
 
-// ================= SERVER =================
-app.get("/", (req, res) => {
-  res.json({ balance, peakBalance, openTrade, cooldownCount });
-});
+/* ================= HOURLY REPORT ================= */
+async function hourlyReport() {
+  const now = new Date(Date.now() + 7 * 3600000);
+  const hourKey = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}-${now.getHours()}`;
 
-app.listen(PORT, () => {
-  console.log(`🚀 BOT RUNNING → PORT ${PORT}`);
-  botLoop();
-});
+  if (lastHourlyReport === hourKey) return;
+  lastHourlyReport = hourKey;
 
-setInterval(botLoop, 30 * 1000);
+  try {
+    const balance = await getBalance();
+    const price = await getSOLPrice();
+    const pnl = balance - startBalance;
+
+    await sendTelegram(
+      `🕐 <b>HOURLY REPORT</b>\n` +
+      `⏰ ${vnTime()}\n` +
+      `Balance: ${balance.toFixed(2)} USDT\n` +
+      `PnL: ${pnl.toFixed(2)} USDT\n` +
+      `SOL Price: ${price}\n` +
+      `Status: ${hasOpenedTrade ? "🟢 ĐANG CÓ LỆNH" : "⚪ KHÔNG CÓ LỆNH"}`
+    );
+  } catch (err) {
+    console.error("Hourly report error:", err);
+  }
+}
+
+/* ================= LOOP ================= */
+async function botLoop() {
+  await hourlyReport();
+
+  if (Date.now() - lastCheck < 30000) return;
+  lastCheck = Date.now();
+
+  if (hasOpenedTrade) return;
+
+  try {
+    const c5 = await fetchKlines5m(300);
+    const c15 = resampleTo15m(c5);
+
+    const closes = c15.map(x => x.close);
+    const ema50 = EMA(closes, CONFIG.emaFast);
+    const ema200 = EMA(closes, CONFIG.emaSlow);
+    const atr = ATR(c15, CONFIG.atrPeriod);
+    const adx = ADX(c15, CONFIG.adxPeriod);
+
+    const signal = getSignal(c15, ema50, ema200, atr, adx);
+    if (signal) await openTrade(signal);
+  } catch (err) {
+    console.error("Bot loop error:", err);
+  }
+}
+
+setInterval(botLoop, 30000);
+
+/* ================= START ================= */
+app.listen(PORT, async () => {
+  try {
+    startBalance = await getBalance();
+    const price = await getSOLPrice();
+
+    await sendTelegram(
+      `🤖 <b>BOT STARTED</b>\n` +
+      `⏰ ${vnTime()}\n` +
+      `Start Balance: ${startBalance.toFixed(2)} USDT\n` +
+      `SOL Price: ${price}\n` +
+      `Status: KHÔNG CÓ LỆNH`
+    );
+
+    console.log(`BOT RUNNING on port ${PORT}`);
+  } catch (err) {
+    console.error("Startup error:", err);
+  }
+});
